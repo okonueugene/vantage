@@ -1,0 +1,27 @@
+2026-03-01 16:59:59,984 | INFO  | VantageV5.Engine | ============================================================
+2026-03-01 16:59:59,985 | INFO  | VantageV5.Engine |   Vantage Engine v4.1 | V41_20260301_135959
+2026-03-01 16:59:59,985 | INFO  | VantageV5.Engine | ============================================================
+2026-03-01 16:59:59,985 | INFO  | VantageV5.Engine | [ LAYER 1 ] Structured API fetch...
+2026-03-01 16:59:59,985 | INFO  | VantageV5.Fetcher | Layer 1: Fetching structured APIs...
+2026-03-01 17:00:03,314 | INFO  | VantageV5.Fetcher | ESPN Premier League: 1 matches
+2026-03-01 17:00:05,065 | INFO  | VantageV5.Fetcher | ESPN La Liga: 3 matches
+2026-03-01 17:00:06,191 | INFO  | VantageV5.Fetcher | ESPN Bundesliga: 3 matches
+2026-03-01 17:00:07,773 | INFO  | VantageV5.Fetcher | ESPN Serie A: 2 matches
+2026-03-01 17:00:09,230 | INFO  | VantageV5.Fetcher | ESPN Ligue 1: 4 matches
+2026-03-01 17:00:10,679 | INFO  | VantageV5.Fetcher | ESPN Eredivisie: 2 matches
+2026-03-01 17:00:12,378 | INFO  | VantageV5.Fetcher | ESPN Primeira Liga: 3 matches
+2026-03-01 17:00:13,689 | INFO  | VantageV5.Fetcher | ESPN Süper Lig: 2 matches
+2026-03-01 17:00:15,607 | INFO  | VantageV5.Fetcher | ESPN Champions League: 0 matches
+2026-03-01 17:00:17,021 | INFO  | VantageV5.Fetcher | ESPN Europa League: 0 matches
+2026-03-01 17:00:17,021 | INFO  | VantageV5.Fetcher | API-Football key not set — skipping (set API_FOOTBALL_KEY)
+2026-03-01 17:00:29,050 | INFO  | VantageV5.Fetcher | TheSportsDB: 0 matches across 6 leagues
+2026-03-01 17:00:29,069 | INFO  | VantageV5.Fetcher | Layer 1 complete — 20 raw records (ESPN: 20, APIF: 0, TSDB: 0)
+2026-03-01 17:00:29,069 | INFO  | VantageV5.Engine |   Raw records: 20
+2026-03-01 17:00:29,069 | INFO  | VantageV5.Engine | [ NORMALIZE ] Canonical names + kickoff format...
+2026-03-01 17:00:29,082 | INFO  | VantageV5.Engine | [ ODDS ] Fetching odds...
+2026-03-01 17:00:29,090 | INFO  | VantageV5.OddsFetcher | Odds enrichment complete — 0/20 matches have odds
+2026-03-01 17:00:29,090 | INFO  | VantageV5.Fallback | Fallback skipped — structured sources gave 20 matches (threshold: 20)
+2026-03-01 17:00:29,090 | INFO  | VantageV5.Engine | [ VALIDATE ] Filtering and scoring...
+2026-03-01 17:00:29,115 | INFO  | VantageV5.Validator | Validation complete: 20 clean matches | High: 0 | Medium: 20
+2026-03-01 17:00:29,132 | INFO  | VantageV5.Engine | Saved: harvest_20260301_1359.csv | harvest_20260301_1359.json
+2026-03-01 17:00:29,132 | INFO  | VantageV5.Engine | Final: 20 matches | 19 columns each
