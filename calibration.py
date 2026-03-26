@@ -129,7 +129,8 @@ class CalibrationLab:
         ns       = self._namespace(market)
         n_sigs   = self._active_signals.get(ns, 1)
         complexity = n_sigs / max(ir, 0.01)
-        prune    = complexity > COMPLEXITY_MAX or (hl is not None and hl < HALFLIFE_MIN)
+        # Don't prune on tiny samples — IR is meaningless below n=20
+        prune    = n >= 20 and (complexity > COMPLEXITY_MAX or (hl is not None and hl < HALFLIFE_MIN))
 
         if prune:
             logger.warning(f"[{market}] PRUNE RECOMMENDED: "

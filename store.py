@@ -116,18 +116,23 @@ CREATE TABLE IF NOT EXISTS league_stats (
 );
 
 CREATE TABLE IF NOT EXISTS team_form (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    team            TEXT NOT NULL,
-    league          TEXT NOT NULL,
-    fetched_at      TEXT NOT NULL,
-    expires_at      TEXT NOT NULL,    -- TTL: 24h
-    league_position INTEGER,
-    form_last5      TEXT,             -- e.g. 'WWLDW'
-    avg_xg_for      REAL,
-    avg_xga         REAL,
-    days_rest       INTEGER,
-    injury_count    INTEGER,
-    raw_json        TEXT
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    team                 TEXT NOT NULL,
+    league               TEXT NOT NULL,
+    fetched_at           TEXT NOT NULL,
+    expires_at           TEXT NOT NULL,
+    league_position      INTEGER,
+    form_last5           TEXT,
+    avg_xg_for           REAL,
+    avg_xga              REAL,
+    avg_goals_for        REAL,
+    avg_goals_against    REAL,
+    avg_shots_on_target  REAL,
+    avg_shots            REAL,
+    days_rest            INTEGER,
+    injury_count         INTEGER,
+    xg_source            TEXT,
+    raw_json             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS ref_stats (
@@ -202,6 +207,12 @@ CREATE TABLE IF NOT EXISTS signal_registry (
     pruned_at   TEXT
 );
 
+CREATE TABLE IF NOT EXISTS run_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    set_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_match_stats     ON match_stats(canonical_id);
 CREATE INDEX IF NOT EXISTS idx_model_metrics   ON model_metrics(metric_date, market);
 CREATE INDEX IF NOT EXISTS idx_signal_registry ON signal_registry(namespace, is_active);
@@ -223,9 +234,22 @@ def _conn():
 
 
 def init_db():
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist, and run any pending migrations."""
     with _conn() as con:
         con.executescript(SCHEMA)
+        # ── Migrations (safe to run repeatedly — IF NOT EXISTS / try/except) ──
+        migrations = [
+            "ALTER TABLE team_form ADD COLUMN xg_source TEXT",
+            "ALTER TABLE team_form ADD COLUMN avg_goals_for REAL",
+            "ALTER TABLE team_form ADD COLUMN avg_goals_against REAL",
+            "ALTER TABLE team_form ADD COLUMN avg_shots_on_target REAL",
+            "ALTER TABLE team_form ADD COLUMN avg_shots REAL",
+        ]
+        for sql in migrations:
+            try:
+                con.execute(sql)
+            except Exception:
+                pass  # column already exists
     logger.info(f"Store initialised: {DB_PATH.resolve()}")
 
 
@@ -611,14 +635,23 @@ def save_team_form(team: str, league: str, form_data: Dict, ttl_hours: int = 24)
         con.execute("""
             INSERT INTO team_form
             (team, league, fetched_at, expires_at, league_position, form_last5,
-             avg_xg_for, avg_xga, days_rest, injury_count, raw_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+             avg_xg_for, avg_xga, avg_goals_for, avg_goals_against,
+             avg_shots_on_target, avg_shots, days_rest, injury_count, xg_source, raw_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             team, league, now.isoformat(), expiry,
-            form_data.get("position"), form_data.get("form_last5"),
-            form_data.get("avg_xg_for"), form_data.get("avg_xga"),
-            form_data.get("days_rest"), form_data.get("injury_count"),
-            json.dumps(form_data)
+            form_data.get("position") or form_data.get("league_position"),
+            form_data.get("form_last5"),
+            form_data.get("avg_xg_for"),
+            form_data.get("avg_xga") or form_data.get("avg_xg_against"),
+            form_data.get("avg_goals_for"),
+            form_data.get("avg_goals_against"),
+            form_data.get("avg_shots_on_target"),
+            form_data.get("avg_shots"),
+            form_data.get("days_rest"),
+            form_data.get("injury_count"),
+            form_data.get("xg_source"),
+            json.dumps(form_data),
         ))
 
 
@@ -689,28 +722,110 @@ def get_clv_summary(last_n: int = 200) -> Dict:
 
 
 def get_brier_scores(last_n: int = 100) -> Dict:
-    """Compare model vs market Brier scores for blend weight calibration."""
+    """
+    Compare model vs market Brier scores → recommended blend weight.
+
+    Blend formula (n >= 30):
+      w_model = (Brier_market - Brier_model) / (Brier_market - Brier_model + eps)
+      eps = 0.02 (regularisation — prevents extreme weights on small samples)
+      Clamped to [0.25, 0.95].
+
+    Stability tiers:
+      n = 0:        blend = 0.60 (no data — conservative default)
+      1 <= n < 30:  blend = 0.60 (not enough to trust formula yet)
+      30 <= n < 200: blend from formula (improving, not yet stable)
+      n >= 200:     blend from formula, blend_stable = True
+
+    Calibration-only rows (stake_kes = 0) are included for Brier — they have
+    real p_true and real outcomes so they're valid signal. Real placed bets
+    (stake_kes > 0) are additionally tracked for CLV.
+    """
+    MIN_FOR_BLEND  = 30
+    STABLE_AT      = 200
+    EPS            = 0.02
+
     with _conn() as con:
         rows = con.execute("""
             SELECT r.outcome, p.p_true, p.p_market
             FROM results r
             JOIN predictions p ON r.canonical_id = p.canonical_id
                                AND r.market = p.market
+            WHERE p.p_true IS NOT NULL AND p.p_market IS NOT NULL
             ORDER BY r.settled_at DESC
             LIMIT ?
         """, (last_n,)).fetchall()
 
-    if not rows:
-        return {"model_brier": None, "market_brier": None, "n": 0}
+    n = len(rows)
 
-    model_bs  = sum((r["p_true"]   - r["outcome"])**2 for r in rows) / len(rows)
-    market_bs = sum((r["p_market"] - r["outcome"])**2 for r in rows) / len(rows)
+    if n == 0:
+        return {
+            "model_brier":        None,
+            "market_brier":       None,
+            "n":                  0,
+            "recommended_blend":  0.60,
+            "blend_stable":       False,
+            "min_sample_for_blend": MIN_FOR_BLEND,
+            "note": "No calibration data yet. Run engine daily — backfill populates this automatically.",
+        }
+
+    model_bs  = sum((r["p_true"]   - r["outcome"]) ** 2 for r in rows) / n
+    market_bs = sum((r["p_market"] - r["outcome"]) ** 2 for r in rows) / n
+
+    if n < MIN_FOR_BLEND:
+        blend = 0.60
+        note  = f"Need {MIN_FOR_BLEND - n} more results for blend formula to activate"
+    else:
+        raw   = (market_bs - model_bs) / (market_bs - model_bs + EPS) if market_bs != model_bs else 0.5
+        blend = round(max(0.25, min(0.95, raw)), 3)
+        note  = f"{'STABLE' if n >= STABLE_AT else 'improving'} — {n} calibration results"
+
     return {
-        "model_brier":  round(model_bs, 5),
-        "market_brier": round(market_bs, 5),
-        "n":            len(rows),
-        "recommended_blend": round(market_bs / (model_bs + market_bs), 3) if (model_bs+market_bs)>0 else 0.6,
+        "model_brier":        round(model_bs, 5),
+        "market_brier":       round(market_bs, 5),
+        "n":                  n,
+        "recommended_blend":  blend,
+        "blend_stable":       n >= STABLE_AT,
+        "min_sample_for_blend": MIN_FOR_BLEND,
+        "note":               note,
     }
+
+
+def get_brier_by_market(last_n: int = 100) -> List[Dict]:
+    """
+    Per-market Brier scores over the last N settled results.
+    Shows which markets the model is actually beating.
+    Returns list sorted by model_edge descending (best first).
+    """
+    with _conn() as con:
+        rows = con.execute("""
+            SELECT r.market,
+                   COUNT(*) as n,
+                   AVG((p.p_true   - r.outcome) * (p.p_true   - r.outcome)) as model_brier,
+                   AVG((p.p_market - r.outcome) * (p.p_market - r.outcome)) as market_brier
+            FROM results r
+            JOIN predictions p ON r.canonical_id = p.canonical_id
+                               AND r.market = p.market
+            WHERE p.p_true IS NOT NULL AND p.p_market IS NOT NULL
+            GROUP BY r.market
+            HAVING COUNT(*) >= 3
+            ORDER BY (AVG((p.p_market - r.outcome)*(p.p_market - r.outcome)) -
+                      AVG((p.p_true   - r.outcome)*(p.p_true   - r.outcome))) DESC
+        """).fetchall()
+
+    result = []
+    for r in rows:
+        model_bs  = round(r["model_brier"], 5)
+        market_bs = round(r["market_brier"], 5)
+        edge = round(market_bs - model_bs, 5)
+        result.append({
+            "market":       r["market"],
+            "n":            r["n"],
+            "model_brier":  model_bs,
+            "market_brier": market_bs,
+            "model_edge":   edge,   # positive = model beating market
+            "beating":      edge > 0,
+        })
+    return result
 
 
 def storage_summary() -> str:
@@ -877,3 +992,139 @@ def get_active_signals(namespace: str) -> List[str]:
         """, (namespace,)).fetchall()
     return [r["signal_name"] for r in rows]
 
+
+# ── Run state (same-day enricher skip) ─────────────────────────────────────────
+def get_last_enrichment_date() -> Optional[str]:
+    """Return the date (YYYY-MM-DD) when enrichers were last run, or None."""
+    with _conn() as con:
+        r = con.execute(
+            "SELECT value FROM run_state WHERE key='last_enrichment_date' LIMIT 1"
+        ).fetchone()
+    return r["value"] if r else None
+
+
+def set_last_enrichment_date(date_str: str) -> None:
+    """Record that enrichers were run for this date (same-day re-runs can skip)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute("""
+            INSERT OR REPLACE INTO run_state (key, value, set_at) VALUES (?,?,?)
+        """, ("last_enrichment_date", date_str, now))
+
+
+
+# ══════════════════════════════════════════════
+# Brier Calibration Backfill
+# ══════════════════════════════════════════════
+def backfill_brier_from_league_stats() -> Dict:
+    """
+    Retroactively populate the results table using:
+      predictions (p_true, p_market, market, canonical_id)
+      fixtures    (canonical_id → home, away, match_date)
+      league_stats (home_team, away_team, match_date → home_goals, away_goals)
+
+    For each prediction where league_stats has the score:
+      - Derive outcome (1/0) for: home_win, draw, away_win, over25, under25
+      - Insert into results with stake_kes=0 (calibration-only, no money)
+
+    Safe to re-run: uses INSERT OR IGNORE on a unique constraint.
+    Returns summary dict.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    inserted = 0
+    skipped  = 0
+
+    with _conn() as con:
+        # Ensure unique constraint exists to make re-runs safe
+        try:
+            con.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_results_calibration
+                ON results(canonical_id, market, settled_at)
+            """)
+        except Exception:
+            pass
+
+        # Join predictions → fixtures → league_stats by team name + date
+        # Uses LOWER() trim for fuzzy-safe exact match (canonical names already normalised)
+        rows = con.execute("""
+            SELECT
+                p.canonical_id,
+                p.market,
+                p.p_true,
+                p.p_market,
+                p.odds        AS placed_odds,
+                f.home,
+                f.away,
+                f.match_date,
+                ls.home_goals,
+                ls.away_goals,
+                ls.total_goals
+            FROM predictions p
+            JOIN fixtures f ON p.canonical_id = f.canonical_id
+            JOIN league_stats ls
+              ON  LOWER(TRIM(ls.home_team)) = LOWER(TRIM(f.home))
+              AND LOWER(TRIM(ls.away_team)) = LOWER(TRIM(f.away))
+              AND ls.match_date = f.match_date
+            WHERE ls.home_goals IS NOT NULL
+              AND ls.away_goals IS NOT NULL
+              AND p.p_true IS NOT NULL
+              AND p.p_market IS NOT NULL
+        """).fetchall()
+
+        logger.info(f"Backfill Brier: {len(rows)} prediction+score pairs found")
+
+        for row in rows:
+            cid         = row["canonical_id"]
+            market      = row["market"]
+            p_true      = row["p_true"]
+            p_market    = row["p_market"]
+            placed_odds = row["placed_odds"] or 0.0
+            home_g      = row["home_goals"]
+            away_g      = row["away_goals"]
+            total_g     = row["total_goals"] or (home_g + away_g)
+
+            # Derive outcome for this market
+            outcome = None
+            if market == "home_win":
+                outcome = 1 if home_g > away_g else 0
+            elif market == "draw":
+                outcome = 1 if home_g == away_g else 0
+            elif market == "away_win":
+                outcome = 1 if away_g > home_g else 0
+            elif market == "over25":
+                outcome = 1 if total_g > 2 else 0
+            elif market == "under25":
+                outcome = 1 if total_g <= 2 else 0
+            elif market == "over15":
+                outcome = 1 if total_g > 1 else 0
+            elif market == "btts_yes":
+                outcome = 1 if (home_g > 0 and away_g > 0) else 0
+            elif market == "btts_no":
+                outcome = 1 if not (home_g > 0 and away_g > 0) else 0
+
+            if outcome is None:
+                skipped += 1
+                continue  # market not derivable from scoreline (corners, cards etc)
+
+            # CLV: if placed_odds > 0, use it; calibration rows have no closing_odds
+            clv = None
+
+            try:
+                con.execute("""
+                    INSERT OR IGNORE INTO results
+                    (canonical_id, market, settled_at, outcome,
+                     closing_odds, placed_odds, clv, beat_close,
+                     stake_kes, pnl_kes)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    cid, market, now, outcome,
+                    None, placed_odds, clv, None,
+                    0.0, 0.0    # calibration-only: no stake/pnl
+                ))
+                inserted += 1
+            except Exception as e:
+                logger.debug(f"Backfill insert skipped {cid} {market}: {e}")
+                skipped += 1
+
+    logger.info(f"Backfill Brier complete: {inserted} inserted, {skipped} skipped")
+    return {"inserted": inserted, "skipped": skipped}

@@ -257,6 +257,59 @@ LEAGUE_PRIORS = {
     "US Open Cup":         {"alpha":5.20,"beta":1.90,"avg_goals":2.80,"home_adv":0.08,
                             "dc_rho":-0.07,"corners_mu":10.2,"corners_k":7.5,
                             "cards_lambda":3.3,"cards_pi":0.05},
+    # ── International ─────────────────────────────────────────────────────────
+    # WCQ characteristics: fewer goals than club football, weak home advantage
+    # (lower motivation variance, defensive setups common), higher draw rate.
+    # Corners lower (national teams play more direct), cards higher (stakes).
+    # UEFA WCQ: competitive European qualifiers, tight margins
+    "UEFA World Cup Qualifiers":     {"alpha":4.80,"beta":1.70,"avg_goals":2.30,"home_adv":0.06,
+                                      "dc_rho":-0.14,"corners_mu":9.8,"corners_k":7.0,
+                                      "cards_lambda":3.8,"cards_pi":0.06},
+    # CONMEBOL WCQ: high-altitude away trips, very physical, lots of draws
+    "CONMEBOL World Cup Qualifiers": {"alpha":4.60,"beta":1.65,"avg_goals":2.20,"home_adv":0.07,
+                                      "dc_rho":-0.15,"corners_mu":9.5,"corners_k":6.8,
+                                      "cards_lambda":4.0,"cards_pi":0.07},
+    # CONCACAF WCQ: uneven quality, home advantage stronger (travel/climate)
+    "CONCACAF World Cup Qualifiers": {"alpha":4.90,"beta":1.75,"avg_goals":2.40,"home_adv":0.09,
+                                      "dc_rho":-0.12,"corners_mu":9.6,"corners_k":7.0,
+                                      "cards_lambda":3.9,"cards_pi":0.07},
+    # CAF WCQ: high variance, strong home advantage, fewer draws
+    "CAF World Cup Qualifiers":      {"alpha":5.00,"beta":1.80,"avg_goals":2.50,"home_adv":0.10,
+                                      "dc_rho":-0.10,"corners_mu":9.4,"corners_k":6.5,
+                                      "cards_lambda":4.2,"cards_pi":0.08},
+    # AFC WCQ: wide quality range (Japan/Korea to Turkmenistan), strong home adv
+    "AFC World Cup Qualifiers":      {"alpha":5.10,"beta":1.85,"avg_goals":2.60,"home_adv":0.10,
+                                      "dc_rho":-0.10,"corners_mu":9.7,"corners_k":7.0,
+                                      "cards_lambda":3.7,"cards_pi":0.06},
+    # OFC WCQ: very low quality, high-scoring (Oceania imbalance)
+    "OFC World Cup Qualifiers":      {"alpha":6.00,"beta":2.20,"avg_goals":3.50,"home_adv":0.12,
+                                      "dc_rho":-0.06,"corners_mu":10.0,"corners_k":7.0,
+                                      "cards_lambda":3.5,"cards_pi":0.05},
+    # UEFA Nations League: higher quality than WCQ, more goals, less defensive
+    "UEFA Nations League":           {"alpha":5.00,"beta":1.80,"avg_goals":2.50,"home_adv":0.07,
+                                      "dc_rho":-0.11,"corners_mu":10.2,"corners_k":7.5,
+                                      "cards_lambda":3.5,"cards_pi":0.05},
+    # CONCACAF Nations League: similar to UEFA NL but more variance
+    "CONCACAF Nations League":       {"alpha":4.90,"beta":1.75,"avg_goals":2.45,"home_adv":0.08,
+                                      "dc_rho":-0.11,"corners_mu":9.8,"corners_k":7.0,
+                                      "cards_lambda":3.8,"cards_pi":0.06},
+    # Copa America: top-quality South American teams, low scoring, very few draws
+    "Copa America":                  {"alpha":4.70,"beta":1.70,"avg_goals":2.20,"home_adv":0.03,
+                                      "dc_rho":-0.12,"corners_mu":9.6,"corners_k":7.2,
+                                      "cards_lambda":4.0,"cards_pi":0.07},
+    # AFCON: tournament format, tight defensive games, many draws in group stage
+    "AFCON":                         {"alpha":4.60,"beta":1.65,"avg_goals":2.10,"home_adv":0.04,
+                                      "dc_rho":-0.14,"corners_mu":9.2,"corners_k":6.8,
+                                      "cards_lambda":4.3,"cards_pi":0.08},
+    # AFC Asian Cup: similar to AFCON, defensive
+    "AFC Asian Cup":                 {"alpha":4.70,"beta":1.70,"avg_goals":2.20,"home_adv":0.04,
+                                      "dc_rho":-0.13,"corners_mu":9.4,"corners_k":7.0,
+                                      "cards_lambda":3.9,"cards_pi":0.07},
+    # International Friendlies: non-competitive, more goals, experimentation
+    # Low weight — engine should be cautious with edge claims on friendlies
+    "International Friendlies":     {"alpha":5.30,"beta":2.00,"avg_goals":2.80,"home_adv":0.04,
+                                      "dc_rho":-0.06,"corners_mu":10.0,"corners_k":7.5,
+                                      "cards_lambda":2.8,"cards_pi":0.04},
     "_default":            {"alpha":5.20,"beta":2.00,"avg_goals":2.60,"home_adv":0.08,
                             "dc_rho":-0.10,"corners_mu":10.5,"corners_k":8.0,
                             "cards_lambda":3.3,"cards_pi":0.05},
@@ -471,8 +524,22 @@ class Predictor:
         if row.get("shot_conversion_delta"): goal_signals["shot_conv"] = float(row["shot_conversion_delta"])
         accepted_goals, _ = self._ortho_goals.filter(goal_signals)
 
-        # Prior-only detection: no xG → model uninformative for 1X2
-        has_team_data = bool(row.get("home_xg") and row.get("away_xg"))
+        # Prior-only detection:
+        #   "understat" = real xG → full blend weight, 1X2 edges allowed
+        #   "sofascore"/"espn" = shots proxy → moderate reliability
+        #   "goals_proxy"/"prior"/missing = undifferentiated goals/g or nothing
+        #     → treat as prior-only: kill 1X2 edges (no team-level signal)
+        REAL_XG_SOURCES = {"understat"}
+        PROXY_XG_SOURCES = {"sofascore", "espn"}  # shots×0.32 — usable but weaker
+        home_xg_src = row.get("home_xg_source", "prior")
+        away_xg_src = row.get("away_xg_source", "prior")
+        has_real_xg   = (row.get("home_xg") and row.get("away_xg")
+                         and home_xg_src in REAL_XG_SOURCES
+                         and away_xg_src in REAL_XG_SOURCES)
+        has_proxy_xg  = (row.get("home_xg") and row.get("away_xg")
+                         and home_xg_src in PROXY_XG_SOURCES
+                         and away_xg_src in PROXY_XG_SOURCES)
+        has_team_data = has_real_xg or has_proxy_xg
         prior_only_markets = {"home_win", "draw", "away_win"}
 
         # Fatigue context
@@ -537,7 +604,16 @@ class Predictor:
                 # No xG/form — heavily market-anchored.
                 # Draws get extra suppression: prior draw rate ~29% inflates EV vs market ~16%.
                 # Without team data we cannot confirm the edge, so penalise further.
-                effective_blend = 0.20 if market == "draw" else 0.30
+                # Hard kill: goals_proxy/prior xG = no reliable 1X2 signal.
+                # Goals/g is symmetric (no home/away split) — model treats
+                # Toluca(1.4 g/g) vs Juarez(1.4 g/g) as 50/50 when market
+                # says 60/40. Any edge is proxy noise, not a real signal.
+                if market in prior_only_markets:
+                    continue
+            elif market in prior_only_markets and has_proxy_xg:
+                # Shots-proxy xG (sofascore/espn): usable but weaker.
+                # Reduce blend to 0.40 (vs 0.60 default) and tighten edge floor.
+                effective_blend = 0.25 if market == "draw" else 0.40
             elif market in ("corners_over","cards_over","corners_under","cards_under"):
                 effective_blend = 0.70
             else:
@@ -578,6 +654,28 @@ class Predictor:
 
             p_true = min(max(p_true, 0.02), 0.97)
             p_true = min(max(p_true * self._cal_slopes.get(market, 1.0), 0.02), 0.97)
+
+            # ── Draw hard cap at long odds ─────────────────────────────────
+            # 0/3 on draws at odds 8.6–9.4. Knockout legs + Betika inflated X
+            # lines create structural illusion of value at these prices.
+            # Cap p_true to prevent lottery-ticket EV from reaching the slip.
+            #   odds ≥ 9.0  → cap at 12% (rare genuine draw at 9+)
+            #   odds ≥ 7.0  → cap at 14% (still hard to trust without large sample)
+            #   odds ≥ 5.0  → cap at 18% (moderate long-draw, some trust)
+            if market == "draw":
+                if odds_val >= 9.0:
+                    if p_true > 0.12:
+                        draw_note += f"longodds_cap(9.0→12%) "
+                        p_true = 0.12
+                elif odds_val >= 7.0:
+                    if p_true > 0.14:
+                        draw_note += f"longodds_cap(7.0→14%) "
+                        p_true = 0.14
+                elif odds_val >= 5.0:
+                    if p_true > 0.18:
+                        draw_note += f"longodds_cap(5.0→18%) "
+                        p_true = 0.18
+
             band   = self._band(p_mod, p_mkt, drs, market)
             ev     = round((p_true * odds_val - 1) * 100, 2)
 
@@ -585,21 +683,67 @@ class Predictor:
             raw_edge = p_true - p_mkt
 
             # Long-odds raw-edge floor (prevents phantom prior-blend edges)
-            # Prior-only blend (no xG/form) is unreliable above 4.0 — floor is deliberately tight
+            # Floor scales with blend weight: higher blend (model trusted less) = stricter floor.
+            # At blend=0.254 (calibrated, model proven better), floor is reduced proportionally.
+            blend_scale = min(1.0, self.blend_weight / 0.60)  # 1.0 at default, <1 when calibrated
+
             if odds_val > 6.0:
-                min_raw_edge = 0.06 if has_team_data else 0.12
+                if not has_team_data:
+                    min_raw_edge = 0.12
+                elif has_proxy_xg:
+                    min_raw_edge = 0.16 * blend_scale
+                else:
+                    min_raw_edge = 0.06 * blend_scale
             elif odds_val > 4.0:
-                min_raw_edge = 0.04 if has_team_data else 0.09
+                if not has_team_data:
+                    min_raw_edge = 0.09
+                elif has_proxy_xg:
+                    min_raw_edge = 0.10 * blend_scale
+                else:
+                    min_raw_edge = 0.04 * blend_scale
             else:
                 min_raw_edge = 0.0
 
+            # Away win at long odds needs stricter floor — same class of problem as draws.
+            # The model's Poisson gives 13% to Pisa away vs Como at 12.0 (market says 8%).
+            # That 5pp gap looks like edge but is noise at these prices with limited data.
+            if market == "away_win":
+                if odds_val >= 8.0:
+                    min_raw_edge = max(min_raw_edge, 0.14 * blend_scale)
+                elif odds_val >= 6.0:
+                    min_raw_edge = max(min_raw_edge, 0.08 * blend_scale)
+
             # Draw EV threshold scales with odds:
             #   odds ≤ 4.0 → need EV ≥ 7%  (base 3 + 4)
-            #   odds > 4.0 → need EV ≥ 18% (base 3 + 15) — high-variance territory
+            #   odds 4–7   → need EV ≥ 18% (base 3 + 15)
+            #   odds > 7.0 → need EV ≥ 25% (base 3 + 22) — very long draw, high bar
             if market == "draw":
-                ev_boost = DRAW_MIN_EV_LONG if odds_val > 4.0 else DRAW_MIN_EV_BOOST
+                if odds_val > 7.0:
+                    ev_boost = 22.0
+                elif odds_val > 4.0:
+                    ev_boost = DRAW_MIN_EV_LONG
+                else:
+                    ev_boost = DRAW_MIN_EV_BOOST
             else:
                 ev_boost = 0.0
+
+            # Friendlies: raise EV bar significantly — non-competitive, squad rotation,
+            # no reliable motivation signal. Treat like long-odds draws.
+            league_name = row.get("league", "")
+            if league_name == "International Friendlies":
+                ev_boost += 15.0  # need EV ≥ 18% minimum on friendlies
+
+            # ── Away win long-odds cap ────────────────────────────────────────
+            # Mirror draw cap for away wins at very long odds.
+            # Como vs Pisa @ 12.0 (p_true=13%) was a prime example of the model
+            # over-trusting Poisson output at extreme prices with limited data.
+            if market == "away_win":
+                if odds_val >= 10.0 and p_true > 0.11:
+                    p_true = 0.11
+                    ev = round((p_true * odds_val - 1) * 100, 2)
+                elif odds_val >= 8.0 and p_true > 0.13:
+                    p_true = 0.13
+                    ev = round((p_true * odds_val - 1) * 100, 2)
 
             ev_threshold = EV_THRESHOLD + ev_boost
             has_edge = ev >= ev_threshold and raw_edge >= min_raw_edge
@@ -664,8 +808,12 @@ class Predictor:
         accepted, _ = self._ortho_corners.filter(signals)
         for sig, val in accepted.items():
             if sig=="possession_pct": mu *= (0.95+0.05*val)
-        p = _nb_over(mu, k, 9.5)
-        return {"corners_over":p, "corners_under":round(1-p,5)}
+        # Use actual line from odds source if available (Betika stores it as corners_line)
+        # Default 9.5 only when no line info — avoids mismatch EV
+        line = float(row.get("corners_line") or 9.5)
+        p_over = _nb_over(mu, k, line)
+        return {"corners_over": p_over, "corners_under": round(1-p_over, 5),
+                "corners_line_used": line}
 
     def _cards(self, row, prior, drs) -> Dict:
         lam = prior["cards_lambda"]; pi = prior["cards_pi"]

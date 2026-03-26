@@ -210,6 +210,32 @@ class PortfolioBuilder:
         compression_overs = (df["regime"] == "compression") & (df["market"] == "over25")
         df = df[~compression_overs]
 
+        # ── Draw-specific safety filters ───────────────────────────────────
+        # 1. CLV drift veto: if draw odds drifted >15% OUT (market moving against)
+        #    → sharp money on the favourite → draw line is stale/wrong
+        if "drift_pct" in df.columns:
+            draw_drift_veto = (
+                (df["market"] == "draw") &
+                (df["drift_pct"].notna()) &
+                (df["drift_pct"] > 15.0)   # positive drift = odds lengthened = bad for X
+            )
+            if draw_drift_veto.any():
+                vetoed = df[draw_drift_veto][["home","away","drift_pct"]].values
+                for h, a, d in vetoed:
+                    logger.info(f"CLV drift veto: {h} vs {a} draw (drift={d:+.1f}% → sharp money on home)")
+            df = df[~draw_drift_veto]
+
+        # 2. Betika vs sharp draw delta: if Betika X is >1.5× the APIF/TheOddsAPI X
+        #    → local book overpricing draw → discount already happened in betika_odds_fetcher
+        #    but add a final veto here if both odds sources present and delta extreme
+        if "odds_X_betika" in df.columns and "odds_X_sharp" in df.columns:
+            sharp_delta_veto = (
+                (df["market"] == "draw") &
+                (df["odds_X_betika"] > df["odds_X_sharp"] * 1.5) &
+                (df["odds_X_sharp"].notna())
+            )
+            df = df[~sharp_delta_veto]
+
         # Liquidity weight: top leagues = 1.0, others = 0.85
         top_leagues = {
             "Premier League", "La Liga", "Bundesliga", "Serie A", "Ligue 1",
@@ -348,6 +374,8 @@ class PortfolioBuilder:
         used_p_leagues = set()
         used_p_markets = set()
         legs = []
+        draw_legs_used = 0
+        MAX_DRAW_LEGS_PARLAY = 2  # allow 2 draws in parlay on European nights
 
         for _, row in available.iterrows():
             if len(legs) >= 4:
@@ -356,11 +384,27 @@ class PortfolioBuilder:
             league = row["league"]
             market = row["market"]
 
-            # Structural diversity: 1 per league, 1 per market
+            # Structural diversity: 1 per league
             if league in used_p_leagues:
                 continue
+
+            # Market diversity: max 1 per market type EXCEPT draws (allow 2 on strong regimes)
             if market in used_p_markets:
-                continue
+                if market == "draw":
+                    # Allow a second draw leg if:
+                    # 1. First draw leg already added (draw_legs_used == 1)
+                    # 2. Both legs in compression or neutral (low-scoring, draw-friendly)
+                    # 3. Raw edge >= 0.05 (not just noise)
+                    regime = row.get("regime", "neutral")
+                    raw_edge = float(row.get("p_true", 0)) - float(row.get("p_market", 0))
+                    if (draw_legs_used < MAX_DRAW_LEGS_PARLAY and
+                            regime in ("compression", "neutral") and
+                            raw_edge >= 0.05):
+                        pass  # allow this second draw leg through
+                    else:
+                        continue
+                else:
+                    continue
 
             # Parlay-specific odds range (wider than before — value exists at longer prices)
             if not (PARLAY_AVG_ODDS_MIN <= float(row["decimal_odds"]) <= PARLAY_AVG_ODDS_MAX):
@@ -377,6 +421,8 @@ class PortfolioBuilder:
             ))
             used_p_leagues.add(league)
             used_p_markets.add(market)
+            if market == "draw":
+                draw_legs_used += 1
 
         if len(legs) < 2:
             return self._empty_parlay(f"Only {len(legs)} valid parlay legs found (need ≥2)")

@@ -113,19 +113,31 @@ function loadDashboard(data) {
         });
     }
 
-    // 4. Render Full Fixture Table (all_predictions)
-    data.all_predictions.forEach(f => {
-        const row = document.createElement("tr");
-        row.className = "hover:bg-slate-700/50 transition border-b border-slate-700 text-sm";
-        row.innerHTML = `
-            <td class="p-4 font-medium">${f.home} vs ${f.away}</td>
-            <td class="p-4 text-slate-400 text-xs">${f.league}</td>
-            <td class="p-4 text-center font-mono text-blue-300">${f.combined_xg || '0.0'}</td>
-            <td class="p-4 text-center font-mono ${f.drs > 0 ? 'text-emerald-400' : 'text-rose-400'}">${f.drs}</td>
-            <td class="p-4 text-slate-500 text-xs">${f.kickoff_utc}</td>
-        `;
-        fixtureTable.appendChild(row);
-    });
+    // 4. Render Fixture Table — only fixtures with data (xG or edge bets)
+    const hasData = (f) => {
+        const hasXg = f.combined_xg != null && f.combined_xg !== '';
+        const hasEdge = f.edge_bets && f.edge_bets.length > 0;
+        return hasXg || hasEdge;
+    };
+    const relevantFixtures = (data.all_predictions || []).filter(hasData);
+
+    if (relevantFixtures.length === 0) {
+        fixtureTable.innerHTML = `
+            <tr><td colspan="5" class="p-6 text-center text-slate-500">No fixtures with data (xG or edge bets). Run the pipeline to enrich.</td></tr>`;
+    } else {
+        relevantFixtures.forEach(f => {
+            const row = document.createElement("tr");
+            row.className = "hover:bg-slate-700/50 transition border-b border-slate-700 text-sm";
+            row.innerHTML = `
+                <td class="p-4 font-medium">${f.home} vs ${f.away}</td>
+                <td class="p-4 text-slate-400 text-xs">${f.league}</td>
+                <td class="p-4 text-center font-mono text-blue-300">${f.combined_xg != null ? f.combined_xg : '—'}</td>
+                <td class="p-4 text-center font-mono ${f.drs > 0 ? 'text-emerald-400' : 'text-rose-400'}">${f.drs}</td>
+                <td class="p-4 text-slate-500 text-xs">${f.kickoff_utc}</td>
+            `;
+            fixtureTable.appendChild(row);
+        });
+    }
 }
     // 5. CRITICAL: Trigger the fetch when the page loads
     window.onload = fetchData;

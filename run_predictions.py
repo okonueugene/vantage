@@ -46,8 +46,9 @@ from store import (
     save_prediction, save_portfolio_predictions,
     classify_regime_from_store, get_cached_team_form,
     get_ref_red_card_rate, get_clv_summary, get_brier_scores,
-    get_hit_rate_by_market, storage_summary, settle_result,
-    stale_fixture_guard, _conn,
+    get_brier_by_market, get_hit_rate_by_market, storage_summary, settle_result,
+    stale_fixture_guard, _conn, save_match_result_for_stats,
+    mark_fixture_finished, backfill_brier_from_league_stats,
 )
 from predictor import Predictor, LEAGUE_PRIORS, EV_THRESHOLD
 from portfolio import PortfolioBuilder, BANKROLL_DEFAULT
@@ -170,6 +171,22 @@ ESPN_LEAGUES = {
     "bra.copa":           "Copa do Brasil",
     "arg.copa":           "Copa Argentina",
     "usa.open":           "US Open Cup",
+    # ── International ─────────────────────────────────────────────────────────
+    # World Cup Qualifiers (by confederation)
+    "fifa.worldq.uefa":      "UEFA World Cup Qualifiers",
+    "fifa.worldq.conmebol":  "CONMEBOL World Cup Qualifiers",
+    "fifa.worldq.concacaf":  "CONCACAF World Cup Qualifiers",
+    "fifa.worldq.caf":       "CAF World Cup Qualifiers",
+    "fifa.worldq.afc":       "AFC World Cup Qualifiers",
+    "fifa.worldq.ofc":       "OFC World Cup Qualifiers",
+    # Continental tournaments
+    "uefa.nations":          "UEFA Nations League",
+    "concacaf.nations":      "CONCACAF Nations League",
+    "conmebol.america":      "Copa America",
+    "caf.nations":           "AFCON",
+    "afc.cup":               "AFC Asian Cup",
+    # Friendlies (lower weight — treated as prior-only)
+    "fifa.friendly":         "International Friendlies",
 }
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
 TOP_LEAGUES = {
@@ -192,6 +209,13 @@ TOP_LEAGUES = {
     "Saudi Pro League", "A-League", "J1 League", "Chinese Super League",
     # UEFA competitions
     "Champions League", "Europa League", "Conference League",
+    # International
+    "UEFA World Cup Qualifiers", "CONMEBOL World Cup Qualifiers",
+    "CONCACAF World Cup Qualifiers", "CAF World Cup Qualifiers",
+    "AFC World Cup Qualifiers", "OFC World Cup Qualifiers",
+    "UEFA Nations League", "CONCACAF Nations League",
+    "Copa America", "AFCON", "AFC Asian Cup",
+    "International Friendlies",
 }
 
 # Canonical league name mapping — handles ESPN returning variant spellings
@@ -245,6 +269,21 @@ _LEAGUE_ALIASES = {
     "Copa Argentina":            "Copa Argentina",
     "U.S. Open Cup":             "US Open Cup",
     "Lamar Hunt U.S. Open Cup":  "US Open Cup",
+    # International — ESPN uses various naming conventions
+    "FIFA World Cup Qualifying - UEFA":     "UEFA World Cup Qualifiers",
+    "FIFA World Cup Qualifying - CONMEBOL": "CONMEBOL World Cup Qualifiers",
+    "FIFA World Cup Qualifying - CONCACAF": "CONCACAF World Cup Qualifiers",
+    "FIFA World Cup Qualifying - CAF":      "CAF World Cup Qualifiers",
+    "FIFA World Cup Qualifying - AFC":      "AFC World Cup Qualifiers",
+    "FIFA World Cup Qualifying - OFC":      "OFC World Cup Qualifiers",
+    "UEFA Nations League":                  "UEFA Nations League",
+    "CONCACAF Nations League":              "CONCACAF Nations League",
+    "Copa America":                         "Copa America",
+    "Africa Cup of Nations":                "AFCON",
+    "AFC Asian Cup":                        "AFC Asian Cup",
+    "International Friendly":               "International Friendlies",
+    "International Friendlies":             "International Friendlies",
+    "Friendlies":                           "International Friendlies",
 }
 
 def _normalize_league(name: str) -> str:
@@ -255,6 +294,332 @@ def _normalize_league(name: str) -> str:
 # ══════════════════════════════════════════════
 # STEP 1 — Fetch or load from store
 # ══════════════════════════════════════════════
+def _patch_odds_fetcher(fixtures: List[Dict], match_date: str) -> List[Dict]:
+    """
+    Enrich fixture odds via OddsFetcher.enrich_with_odds(df).
+
+    Strategy (2026-03-08 rewrite):
+      - API-Football /odds endpoint has NO team names.
+      - OddsFetcher fetches /fixtures?date= (has names) + /odds?date= (has odds),
+        joins on fixture.id, then fuzzy-matches to our ESPN rows.
+      - enrich_with_odds() accepts a DataFrame and returns it enriched.
+    """
+    if not fixtures:
+        return fixtures
+
+    # ── Pass 1: Betika (primary) ──────────────────────────────────────────────
+    # Betika is the most reliable local odds source. Runs first so APIF/TheOddsAPI
+    # only fill markets Betika couldn't cover (mainly over25/under25 goals lines,
+    # which Betika's API corrupts for lines 0.5–3.5).
+    # Writes directly to fx["odds"] in-place.
+    try:
+        from betika_odds_fetcher import BetikaOddsFetcher
+        betika = BetikaOddsFetcher()
+        n_betika = betika.enrich(fixtures)
+        if n_betika:
+            logger.info(f"Betika: {n_betika}/{len(fixtures)} fixtures enriched (1X2/BTTS/corners/cards)")
+        else:
+            logger.info("Betika: 0 fixtures matched — check team names or kickoff times")
+    except Exception as e:
+        logger.warning(f"Betika pass failed: {e}")
+
+    # ── Pass 2: API-Football (fill gaps) ─────────────────────────────────────
+    # APIF fills markets not covered by Betika — primarily over25/under25.
+    # Does NOT overwrite markets already set by Betika.
+    try:
+        import pandas as pd
+        from odds_fetcher import OddsFetcher
+        fetcher = OddsFetcher()
+
+        if not fetcher.enabled:
+            logger.debug("OddsFetcher: no API_FOOTBALL_KEY — skipping")
+        else:
+            logger.info("OddsFetcher: enriching odds via date-based bulk fetch…")
+
+            rows = []
+            for i, fx in enumerate(fixtures):
+                rows.append({
+                    "_idx":    i,
+                    "home":    fx.get("home", ""),
+                    "away":    fx.get("away", ""),
+                    "league":  fx.get("league", ""),
+                    "kickoff": fx.get("kickoff") or match_date,
+                })
+            df = pd.DataFrame(rows)
+            df = fetcher.enrich_with_odds(df)
+
+            # Map APIF odds into fx["odds"] — only fill missing markets
+            apif_map = {
+                "home_win": "odds_1", "draw": "odds_X", "away_win": "odds_2",
+                "over25": "odds_over25", "under25": "odds_u25",
+                "btts_yes": "odds_btts_yes",
+                "corners_over": "odds_corners_over", "cards_over": "odds_cards_over",
+            }
+            apif_enriched = 0
+            for _, row in df.iterrows():
+                if row.get("odds_source") in (None, "", "none"):
+                    continue
+                fx = fixtures[int(row["_idx"])]
+                fx_odds = fx.setdefault("odds", {})
+                added = False
+                for market, col in apif_map.items():
+                    val = row.get(col)
+                    if val and val != "-" and market not in fx_odds:
+                        try:
+                            fx_odds[market] = float(val)
+                            cid = fx.get("canonical_id", "")
+                            if cid:
+                                save_odds_snapshot(cid, market, float(val),
+                                                   source=row["odds_source"])
+                            added = True
+                        except (TypeError, ValueError):
+                            pass
+                if added:
+                    apif_enriched += 1
+                    fx["_odds_fresh"] = True
+            logger.info(f"API-Football: gap-filled {apif_enriched} fixtures")
+
+    except ImportError:
+        logger.debug("odds_fetcher.py not found — skipping")
+    except Exception as e:
+        logger.warning(f"OddsFetcher failed (non-fatal): {e}")
+
+    # ── Pass 3: TheOddsAPI (fill remaining gaps) ──────────────────────────────
+    # Last resort — mainly useful for over25/under25 when APIF also missed.
+    # Does NOT overwrite markets already set by Betika or APIF.
+    try:
+        import pandas as pd
+        from odds_fetcher import TheOddsAPIFetcher
+        ta_fetcher = TheOddsAPIFetcher()
+        if ta_fetcher.enabled:
+            rows = []
+            for i, fx in enumerate(fixtures):
+                rows.append({
+                    "_idx":    i,
+                    "home":    fx.get("home", ""),
+                    "away":    fx.get("away", ""),
+                    "league":  fx.get("league", ""),
+                    "kickoff": fx.get("kickoff") or match_date,
+                })
+            df_ta = pd.DataFrame(rows)
+            df_ta = ta_fetcher.enrich(df_ta)
+
+            ta_map = {
+                "home_win": "odds_1", "draw": "odds_X", "away_win": "odds_2",
+                "over25": "odds_over25", "under25": "odds_u25",
+            }
+            ta_enriched = 0
+            for _, row in df_ta.iterrows():
+                if row.get("odds_source") in (None, "", "none"):
+                    continue
+                fx = fixtures[int(row["_idx"])]
+                fx_odds = fx.setdefault("odds", {})
+                added = False
+                for market, col in ta_map.items():
+                    val = row.get(col)
+                    if val and val != "-" and market not in fx_odds:
+                        try:
+                            fx_odds[market] = float(val)
+                            cid = fx.get("canonical_id", "")
+                            if cid:
+                                save_odds_snapshot(cid, market, float(val),
+                                                   source="TheOddsAPI")
+                            added = True
+                        except (TypeError, ValueError):
+                            pass
+                if added:
+                    ta_enriched += 1
+                    fx["_odds_fresh"] = True
+            logger.info(f"TheOddsAPI: gap-filled {ta_enriched} fixtures")
+    except Exception as e:
+        logger.debug(f"TheOddsAPI pass skipped: {e}")
+
+    # ── Persist Betika-specific markets (corners_*, cards_* granular lines) ───
+    for fx in fixtures:
+        fx_odds = fx.get("odds", {})
+        betika_only = {k: v for k, v in fx_odds.items()
+                       if k.startswith(("corners_", "cards_", "btts_"))
+                       and isinstance(v, (int, float))}
+        cid = fx.get("canonical_id", "")
+        if cid and betika_only:
+            for market, val in betika_only.items():
+                try:
+                    save_odds_snapshot(cid, market, float(val), source="Betika")
+                except Exception:
+                    pass
+
+    enriched = sum(1 for fx in fixtures if fx.get("odds") and fx.get("_odds_fresh"))
+    total_with_any = sum(1 for fx in fixtures if fx.get("odds"))
+    logger.info(f"OddsFetcher: {enriched}/{len(fixtures)} fixtures freshly enriched this session ({total_with_any} have any odds)")
+    return fixtures
+
+
+def backfill_results_from_espn(days_back: int = 7) -> int:
+    """
+    Fetch completed match scores from ESPN for the last N days → league_stats.
+
+    Speed optimisation: one HTTP call per league (ESPN accepts comma-separated
+    dates OR a range via the dates param). We use a date-range string covering
+    all days_back days in a single request per league (~15 calls total, ~10s).
+
+    Idempotent: league_stats uses INSERT OR IGNORE so reruns are safe.
+    Does NOT touch the results table (placed-bets only).
+    """
+    from datetime import timedelta
+    now    = datetime.now(timezone.utc)
+    season = "2025-26"
+    new_count = 0
+
+    # Build comma-separated date string: ESPN accepts ?dates=20260301,20260302,...
+    dates_param = ",".join(
+        (now - timedelta(days=d)).strftime("%Y%m%d")
+        for d in range(1, days_back + 1)
+    )
+
+    # Check which dates we already have data for — skip those leagues entirely
+    with _conn() as con:
+        existing_dates = {
+            r["match_date"] for r in
+            con.execute("SELECT DISTINCT match_date FROM league_stats").fetchall()
+        }
+
+    need_dates = set(
+        (now - timedelta(days=d)).strftime("%Y-%m-%d")
+        for d in range(1, days_back + 1)
+    ) - existing_dates
+
+    if not need_dates:
+        logger.info("Backfill: all dates already in league_stats — skipping")
+        return 0
+
+    logger.info(f"Backfill: fetching {len(need_dates)} missing date(s) across {len(ESPN_LEAGUES)} leagues")
+
+    # Fetch per-date (not comma-separated) — ESPN multi-date param is unreliable
+    # across leagues. Sequential but fast (0.2–0.4s sleep = ~30s for 7 days × 53 leagues).
+    for days_ago in range(1, days_back + 1):
+        target     = (now - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        espn_date  = target.replace("-", "")
+
+        if target not in need_dates:
+            continue
+
+        for code, league_name in ESPN_LEAGUES.items():
+            url = ESPN_BASE.format(league=code) + f"?dates={espn_date}"
+            try:
+                time.sleep(random.uniform(0.2, 0.4))
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "Mozilla/5.0 (VantageEngine/4.1)",
+                    "Accept": "application/json",
+                })
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    data = json.loads(resp.read().decode())
+            except Exception as e:
+                logger.debug(f"Backfill ESPN {league_name}: {e}")
+                continue
+
+            league_norm = _normalize_league(league_name)
+
+            for event in data.get("events", []):
+                try:
+                    comp   = event["competitions"][0]
+                    status = comp.get("status", {}).get("type", {})
+    
+                    if status.get("state") != "post" or not status.get("completed", False):
+                        continue
+    
+                    competitors = comp.get("competitors", [])
+                    if len(competitors) < 2:
+                        continue
+    
+                    home_obj = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
+                    away_obj = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
+    
+                    home = normalize_team(home_obj["team"]["displayName"])
+                    away = normalize_team(away_obj["team"]["displayName"])
+    
+                    home_goals = int(home_obj.get("score", 0) or 0)
+                    away_goals = int(away_obj.get("score", 0) or 0)
+    
+                    match_date = event.get("date", "")[:10]  # "2026-03-07T..."[:10]
+                    if match_date not in need_dates:
+                        continue  # already have this date
+    
+                    cid = (f"{re.sub(r'[^A-Za-z]','',home)[:4].upper()}_"
+                           f"{re.sub(r'[^A-Za-z]','',away)[:4].upper()}_"
+                           f"{match_date.replace('-','')}")
+    
+                    upsert_fixture({
+                        "canonical_id": cid,
+                        "home":         home,
+                        "away":         away,
+                        "league":       league_norm,
+                        "kickoff_utc":  match_date + " 00:00 UTC",
+                        "match_date":   match_date,
+                        "status":       "finished",
+                        "source":       "ESPN_BACKFILL",
+                        "odds":         {},
+                    })
+    
+                    save_match_result_for_stats(
+                        league=league_norm,
+                        season=season,
+                        match_date=match_date,
+                        home=home,
+                        away=away,
+                        home_goals=home_goals,
+                        away_goals=away_goals,
+                    )
+
+                    # Extract post-match stats (corners, shots, cards, possession)
+                    # ESPN puts these in comp["statistics"] for completed matches
+                    try:
+                        from store import save_match_stats
+                        stats_raw = comp.get("statistics", [])
+                        def _stat(name):
+                            for s in stats_raw:
+                                if s.get("name","").lower() == name.lower():
+                                    vals = s.get("stats", s.get("values", []))
+                                    if len(vals) >= 2:
+                                        try: return int(float(vals[0])), int(float(vals[1]))
+                                        except: pass
+                            return None, None
+
+                        ch, ca = _stat("cornerKicks")
+                        sh, sa = _stat("totalShots")
+                        soth, sota = _stat("shotsOnTarget")
+                        yh, ya = _stat("yellowCards")
+                        rh, ra = _stat("redCards")
+                        ph, pa = _stat("possessionPct")
+
+                        if any(v is not None for v in [ch, sh, yh]):
+                            save_match_stats(cid, {
+                                "xg_home":         None,
+                                "xg_away":         None,
+                                "corners_home":    ch,
+                                "corners_away":    ca,
+                                "shots_home":      sh,
+                                "shots_away":      sa,
+                                "shots_on_home":   soth,
+                                "shots_on_away":   sota,
+                                "cards_home":      (yh or 0) + (rh or 0),
+                                "cards_away":      (ya or 0) + (ra or 0),
+                                "possession_home": ph,
+                                "possession_away": pa,
+                                "source":          "ESPN_BACKFILL",
+                            })
+                    except Exception:
+                        pass
+
+                    new_count += 1
+    
+                except Exception as e:
+                    logger.debug(f"Backfill parse error {league_name}: {e}")
+                    continue
+    
+    logger.info(f"Backfill complete — {new_count} new results written to league_stats")
+    return new_count
+
+
 def fetch_or_load_fixtures(
     target_date: Optional[str] = None,
     lookahead: int = 2,
@@ -263,23 +628,101 @@ def fetch_or_load_fixtures(
     Load fixtures for target_date (default: today UTC).
     If no fixtures found, look ahead up to `lookahead` days.
     Always runs stale_fixture_guard to drop matches that have already kicked off.
+
+    Cache-hit logic: if fixtures are cached but none of the newly-added
+    international leagues are represented, we do a targeted re-fetch for
+    those leagues and merge the results.
     """
     today = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Try cache first for the target date
+    ALL_MARKETS = ["home_win","draw","away_win","over25","under25","corners_over","cards_over"]
+
+    # International leagues that may not be in older cache entries
+    INTL_LEAGUES = {
+        "UEFA World Cup Qualifiers", "CONMEBOL World Cup Qualifiers",
+        "CONCACAF World Cup Qualifiers", "CAF World Cup Qualifiers",
+        "AFC World Cup Qualifiers", "OFC World Cup Qualifiers",
+        "UEFA Nations League", "CONCACAF Nations League",
+        "Copa America", "AFCON", "AFC Asian Cup",
+        "International Friendlies",
+    }
+    INTL_ESPN_CODES = {
+        "UEFA World Cup Qualifiers":     "fifa.worldq.uefa",
+        "CONMEBOL World Cup Qualifiers": "fifa.worldq.conmebol",
+        "CONCACAF World Cup Qualifiers": "fifa.worldq.concacaf",
+        "CAF World Cup Qualifiers":      "fifa.worldq.caf",
+        "AFC World Cup Qualifiers":      "fifa.worldq.afc",
+        "OFC World Cup Qualifiers":      "fifa.worldq.ofc",
+        "UEFA Nations League":           "uefa.nations",
+        "CONCACAF Nations League":       "concacaf.nations",
+        "Copa America":                  "conmebol.america",
+        "AFCON":                         "caf.nations",
+        "AFC Asian Cup":                 "afc.cup",
+        "International Friendlies":      "fifa.friendly",
+    }
+
     cached = get_todays_fixtures(today)
     if cached:
         logger.info(f"Store hit: {len(cached)} fixtures cached for {today}")
         for fx in cached:
             if "odds" not in fx or not fx["odds"]:
                 fx["odds"] = {}
-                for m in ["home_win","draw","away_win","over25","under25"]:
+            for m in ALL_MARKETS:
+                if m not in fx["odds"]:
                     v = _get_stored_odds(fx.get("canonical_id",""), m)
                     if v:
                         fx["odds"][m] = v
 
+        # Check if any international fixtures are missing from cache
+        cached_leagues = {fx.get("league","") for fx in cached}
+        missing_intl = INTL_LEAGUES - cached_leagues
+        if missing_intl:
+            logger.info(f"Cache hit but {len(missing_intl)} international league(s) missing — fetching: {', '.join(sorted(missing_intl))}")
+            date_fmt = today.replace("-","")
+            import urllib.request as _ur, json as _json
+            ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/soccer/{}/scoreboard"
+            new_fixtures = []
+            for league_name in missing_intl:
+                code = INTL_ESPN_CODES.get(league_name)
+                if not code:
+                    continue
+                try:
+                    url = ESPN_SCOREBOARD.format(code) + f"?dates={date_fmt}"
+                    req = _ur.Request(url, headers={"User-Agent": "VantageEngine/4.1"})
+                    with _ur.urlopen(req, timeout=8) as r:
+                        data = _json.loads(r.read())
+                    events = data.get("events", [])
+                    if not events:
+                        continue
+                    logger.info(f"  ✓ {league_name}: {len(events)} fixture(s)")
+                    for event in events:
+                        comps = event.get("competitions", [{}])[0]
+                        competitors = comps.get("competitors", [{},{}])
+                        home = competitors[0].get("team", {}).get("displayName", "")
+                        away = competitors[1].get("team", {}).get("displayName", "")
+                        if not home or not away:
+                            continue
+                        kick_str = event.get("date", "")
+                        fx = {
+                            "home": home, "away": away,
+                            "league": league_name,
+                            "kickoff": kick_str,
+                            "espn_id": event.get("id",""),
+                            "odds": {},
+                            "canonical_id": f"{home[:4].upper()}_{away[:4].upper()}_{today.replace('-','')}",
+                        }
+                        upsert_fixture(fx)
+                        new_fixtures.append(fx)
+                except Exception as e:
+                    logger.debug(f"  International fetch failed {league_name}: {e}")
+            if new_fixtures:
+                logger.info(f"  Added {len(new_fixtures)} international fixture(s) to cache")
+                cached = cached + new_fixtures
+
         fixtures, stale = stale_fixture_guard(cached)
         _log_stale(stale)
+        fixtures = _patch_odds_fetcher(fixtures, today)
         return fixtures, True
 
     # Fetch from ESPN — try target date first, then look ahead
@@ -300,6 +743,7 @@ def fetch_or_load_fixtures(
                 )
             fixtures, stale = stale_fixture_guard(raw)
             _log_stale(stale)
+            fixtures = _patch_odds_fetcher(fixtures, attempt_date)
             return fixtures, False
 
     logger.info(
@@ -456,18 +900,106 @@ def enrich_fixture(fixture: Dict) -> Dict:
     home_form = get_cached_team_form(home, league) or {}
     away_form = get_cached_team_form(away, league) or {}
 
+    # For cup/European competitions, teams are stored under their domestic league.
+    # Fall back to any-league lookup if the cup-specific lookup returned nothing.
+    CUP_LEAGUES = {
+        "Champions League", "Europa League", "Conference League",
+        "FA Cup", "EFL Cup", "Coppa Italia", "Copa del Rey", "DFB-Pokal",
+        "Coupe de France", "Copa Argentina", "Copa do Brasil", "US Open Cup",
+        # International — use domestic club xG as fallback for national team form
+        "UEFA World Cup Qualifiers", "CONMEBOL World Cup Qualifiers",
+        "CONCACAF World Cup Qualifiers", "CAF World Cup Qualifiers",
+        "AFC World Cup Qualifiers", "OFC World Cup Qualifiers",
+        "UEFA Nations League", "CONCACAF Nations League",
+        "Copa America", "AFCON", "AFC Asian Cup",
+        "International Friendlies",
+    }
+    if league in CUP_LEAGUES:
+        def _has_useful_form(f):
+            return f and (f.get("avg_xg_for") is not None or f.get("avg_goals_for") is not None)
+
+        if not _has_useful_form(home_form):
+            with _conn() as con:
+                rows = con.execute("""
+                    SELECT * FROM team_form WHERE team=?
+                    AND avg_xg_for IS NOT NULL
+                    ORDER BY fetched_at DESC LIMIT 1
+                """, (home,)).fetchone()
+                if rows:
+                    rest = home_form.get("days_rest")  # preserve cup rest days
+                    home_form = dict(rows)
+                    if rest is not None:
+                        home_form["days_rest"] = rest  # cup rest days are more accurate
+
+        if not _has_useful_form(away_form):
+            with _conn() as con:
+                rows = con.execute("""
+                    SELECT * FROM team_form WHERE team=?
+                    AND avg_xg_for IS NOT NULL
+                    ORDER BY fetched_at DESC LIMIT 1
+                """, (away,)).fetchone()
+                if rows:
+                    rest = away_form.get("days_rest")
+                    away_form = dict(rows)
+                    if rest is not None:
+                        away_form["days_rest"] = rest
+
     # Only use real form data — do NOT fall back to league prior as fake xG.
     # If no form data exists, leave xG as None so predictor knows it has no team data.
-    home_xg = home_form.get("avg_xg_for")   # None if no cached form
-    away_xg = away_form.get("avg_xg_for")   # None if no cached form
+    home_xg     = home_form.get("avg_xg_for")   # None if no cached form
+    away_xg     = away_form.get("avg_xg_for")   # None if no cached form
+    home_xg_src = home_form.get("xg_source") or None
+    away_xg_src = away_form.get("xg_source") or None
+
+    # Source tiers — determines 1X2 reliability in predictor:
+    #   understat  → real xG (shot-quality model) — full blend, 1X2 allowed
+    #   espn       → shots×0.32 proxy — reduced blend, 1X2 allowed (cautious)
+    #   sofascore  → shots-based xG for most leagues — reduced blend, 1X2 allowed
+    #   goals_proxy→ raw goals/g used as xG (no shot data) — 1X2 KILLED
+    #   prior      → no form data at all — 1X2 KILLED
+    UNDERSTAT_LEAGUES = {"Premier League", "La Liga", "Bundesliga", "Serie A", "Ligue 1"}
+    # Leagues where Sofascore stores real xG (shot-quality, not goals/g)
+    SOFASCORE_REAL_XG = {
+        "Eredivisie", "Belgian Pro League", "Primeira Liga", "Süper Lig",
+        "Scottish Premiership", "Championship", "J1 League", "Saudi Pro League",
+        "A-League", "Chinese Super League",
+    }
+
+    def _infer_src(form: dict, lg: str) -> str:
+        xg_val  = form.get("avg_xg_for")
+        g_val   = form.get("avg_goals_for")
+        stored  = form.get("xg_source")
+        if stored:
+            return stored
+        if xg_val:
+            if lg in UNDERSTAT_LEAGUES:
+                return "understat"
+            if lg in SOFASCORE_REAL_XG:
+                return "sofascore"
+            # Sofascore ran but may have stored goals/g — tag conservatively
+            return "goals_proxy"
+        if g_val:
+            return "goals_proxy"
+        return "prior"
+
+    home_xg_src = _infer_src(home_form, league)
+    away_xg_src = _infer_src(away_form, league)
+
+    # Fallback: goals/g as xG value — tag as goals_proxy
+    if home_xg is None and home_form.get("avg_goals_for"):
+        home_xg = home_form["avg_goals_for"]
+        home_xg_src = "goals_proxy"
+    if away_xg is None and away_form.get("avg_goals_for"):
+        away_xg = away_form["avg_goals_for"]
+        away_xg_src = "goals_proxy"
 
     ref_name = fixture.get("referee","")
     drs_base = get_ref_red_card_rate(ref_name, league) if ref_name else 0.12
     inj_bump = ((home_form.get("injury_count",0) or 0) + (away_form.get("injury_count",0) or 0)) * 0.005
     drs      = round(min(drs_base + inj_bump, 0.40), 3)
 
-    home_pos = home_form.get("league_position", 10) or 10
-    away_pos = away_form.get("league_position", 10) or 10
+    home_pos = home_form.get("league_position") or home_form.get("position") or 10
+    away_pos = away_form.get("league_position") or away_form.get("position") or 10
     motiv    = min(max(away_pos - home_pos, -10), 10)
 
     odds = dict(fixture.get("odds") or {})
@@ -480,12 +1012,13 @@ def enrich_fixture(fixture: Dict) -> Dict:
         if raw:
             try:
                 raw_odds = _json.loads(raw).get("odds", {})
-                for market in ("home_win", "draw", "away_win", "over25", "under25"):
+                for market in ("home_win", "draw", "away_win", "over25", "under25",
+                               "corners_over", "cards_over", "btts_yes"):
                     if market in raw_odds and market not in odds:
                         odds[market] = raw_odds[market]
             except Exception:
                 pass
-    for market in ["home_win","draw","away_win","over25","under25"]:
+    for market in ["home_win","draw","away_win","over25","under25","corners_over","cards_over"]:
         drift = get_line_movement(cid, market)
         if drift is not None:
             odds[f"{market}_drift_pct"] = drift
@@ -515,6 +1048,8 @@ def enrich_fixture(fixture: Dict) -> Dict:
         "motivation_delta":     motiv,
         "home_xg":              home_xg,
         "away_xg":              away_xg,
+        "home_xg_source":       home_xg_src,
+        "away_xg_source":       away_xg_src,
         "combined_xg":          round(home_xg + away_xg, 2) if home_xg and away_xg else None,
         "home_position":        home_pos,
         "away_position":        away_pos,
@@ -545,7 +1080,18 @@ def run_predictions_pipeline(
 
     brier = get_brier_scores(last_n=100)
     blend_weight = brier.get("recommended_blend", 0.60)
-    logger.info(f"Blend weight: {blend_weight:.3f}  (n={brier.get('n',0)} calibration bets)")
+    n_cal = brier.get("n", 0)
+
+    if n_cal == 0:
+        logger.info("Blend weight: 0.600 (default — no calibration data yet; backfill populates automatically)")
+    elif n_cal < brier.get("min_sample_for_blend", 30):
+        logger.info(f"Blend weight: {blend_weight:.3f}  (default — need {brier['min_sample_for_blend'] - n_cal} more results for formula | n={n_cal})")
+    else:
+        stable = " [STABLE]" if brier.get("blend_stable") else ""
+        logger.info(
+            f"Blend weight: {blend_weight:.3f}{stable}  "
+            f"(n={n_cal} | model_BS={brier['model_brier']:.4f} market_BS={brier['market_brier']:.4f})"
+        )
 
     # Load calibration slopes — prefer model_metrics table (persistent),
     # fall back to CalibrationLab in-memory if table empty
@@ -592,13 +1138,19 @@ def run_predictions_pipeline(
             "odds_2":      odds_map.get("away_win"),
             "odds_over25": odds_map.get("over25"),
             "odds_u25":    odds_map.get("under25"),
+            # Corners / cards odds (from OddsFetcher or manual feed)
+            "odds_corners_over": odds_map.get("corners_over"),
+            "odds_cards_over":   odds_map.get("cards_over"),
             # xG features (for Poisson lambdas + GameTempo)
             "home_xg":         enriched.get("home_xg"),
             "away_xg":         enriched.get("away_xg"),
+            "home_xg_source":  enriched.get("home_xg_source", "prior"),
+            "away_xg_source":  enriched.get("away_xg_source", "prior"),
             "home_n_matches":  enriched.get("home_n_matches", 5),
             # Corners features
             "home_corners_avg": enriched.get("home_corners_avg"),
             "away_corners_avg": enriched.get("away_corners_avg"),
+            "corners_line":     fx.get("odds", {}).get("corners_line"),
             # Cards features
             "home_foul_rate":  enriched.get("home_foul_rate"),
             "away_foul_rate":  enriched.get("away_foul_rate"),
@@ -632,12 +1184,20 @@ def run_predictions_pipeline(
                 league_sample_size=_league_sample_size(enriched["league"]),
             )
             raw_kelly = max((pred.p_true*pred.decimal_odds-1)/(pred.decimal_odds-1),0) if pred.decimal_odds>1 else 0
-            raw_stake = min(raw_kelly*0.5, 0.03) * bankroll
+
+            # Uncertainty-adjusted Kelly: stake naturally grows as calibration n increases.
+            # penalty = 1/(1+√(n/30)) → 1.0 at n=0, 0.77 at n=30, 0.59 at n=100, 0.50 at n=200+
+            # Full formula: 0.35 × Kelly × uncertainty_penalty (conservative base = 35% Kelly)
+            # Capped at 3% bankroll per bet regardless.
+            import math as _math
+            n_cal = brier.get("n", 0)
+            uncertainty_penalty = 1.0 / (1.0 + _math.sqrt(n_cal / 30.0)) if n_cal > 0 else 1.0
+            raw_stake = min(raw_kelly * 0.35 * uncertainty_penalty, 0.03) * bankroll
             adj = risk.adjust_stake(raw_stake, signal)
 
             drift = odds_map.get(f"{pred.market}_drift_pct")
             drift_note = ""
-            if drift and drift > 5:
+            if drift and 5 < drift < 100:   # >100% move = data artifact from stale/flipped snapshot
                 drift_note = f"Odds drifted out +{drift:.1f}% (possible steam against)"
             elif drift and drift < -5:
                 drift_note = f"Odds shortened {drift:.1f}% (market confirming)"
@@ -881,6 +1441,28 @@ def run(
     logger.info(storage_summary())
     logger.info(f"{'='*60}")
 
+    # ── Backfill historical results for regime/rolling mean training ──────────
+    # Runs on every session start. Fetches completed ESPN matches for last 7 days
+    # and writes scores to league_stats. Safe to run repeatedly (INSERT OR IGNORE).
+    # Takes ~5-10s. Silently skips if no network.
+    try:
+        n_backfilled = backfill_results_from_espn(days_back=7)
+        if n_backfilled > 0:
+            logger.info(f"Backfill: {n_backfilled} historical results loaded into league_stats")
+    except Exception as e:
+        logger.debug(f"Backfill skipped (non-fatal): {e}")
+
+    # ── Brier calibration backfill ────────────────────────────────────────────
+    # Join predictions + league_stats scores → populate results table with outcomes.
+    # Runs every session (INSERT OR IGNORE = safe). Unlocks Brier blend weight
+    # as soon as predictions + scores are both present.
+    try:
+        brier_backfill = backfill_brier_from_league_stats()
+        if brier_backfill["inserted"] > 0:
+            logger.info(f"Brier backfill: {brier_backfill['inserted']} new calibration results added")
+    except Exception as e:
+        logger.debug(f"Backfill skipped (non-fatal): {e}")
+
     fixtures, from_cache = fetch_or_load_fixtures(target_date=target_date, lookahead=lookahead)
     if not fixtures:
         output = {"meta": {"run_id":run_id,"date":today,"bankroll_kes":bankroll,
@@ -901,27 +1483,42 @@ def run(
             "SELECT COUNT(DISTINCT home) + COUNT(DISTINCT away) as n "
             "FROM fixtures WHERE match_date=? AND status='unplayed'", (today,)
         ).fetchone()["n"] or 1
-        cached_xg = con.execute(
-            "SELECT COUNT(DISTINCT team) as n FROM team_form "
-            "WHERE expires_at > ? AND avg_xg_for IS NOT NULL",
-            (now.isoformat(),)
-        ).fetchone()["n"] or 0
+        # Count only today's fixture teams that have fresh, sourced xG
+        # (xg_source NULL = pre-migration entry, don't count as warm)
+        cached_xg = con.execute("""
+            SELECT COUNT(*) as n FROM (
+                SELECT DISTINCT tf.team FROM team_form tf
+                JOIN fixtures fx ON (tf.team = fx.home OR tf.team = fx.away)
+                WHERE fx.match_date=? AND fx.status='unplayed'
+                  AND tf.expires_at > ? AND tf.avg_xg_for IS NOT NULL
+                  AND tf.xg_source IS NOT NULL
+            )
+        """, (today, now.isoformat())).fetchone()["n"] or 0
     cache_pct = cached_xg / max(total_fx, 1)
 
-    if cache_pct >= 0.20:
-        logger.info(f"Form cache warm ({cached_xg}/{total_fx} teams with xG) — skipping enrichment")
+    if cache_pct >= 0.75:
+        logger.info(f"Form cache warm ({cached_xg}/{total_fx} teams with sourced xG) — skipping enrichment")
     else:
         logger.info(f"Form cache cold ({cached_xg}/{total_fx} teams) — running enrichers")
 
-        # Stage 1: FBref real xG (top leagues only)
+        # Stage 1: Understat real xG (EPL/La Liga/Bundesliga/Serie A/Ligue 1)
+        # One page load per league covers all ~20 teams. No CF, no API key.
         try:
-            from fbref_enricher import enrich_todays_fixtures as fbref_enrich
-            fbref_enrich(match_date=today)
-            logger.info("FBref enrichment complete")
+            from understat_enricher import enrich_todays_fixtures as understat_enrich
+            understat_enrich(match_date=today)
+            logger.info("Understat enrichment complete")
         except Exception as e:
-            logger.warning(f"FBref enricher failed (non-fatal): {e}")
+            logger.warning(f"Understat enricher failed (non-fatal): {e}")
 
-        # Stage 2: ESPN fallback for remaining teams
+        # Stage 2: Sofascore — Americas, Asia, Middle East (leagues ESPN has no stats for)
+        try:
+            from sofascore_enricher import enrich_todays_fixtures as sofascore_enrich
+            sofascore_enrich(match_date=today)
+            logger.info("Sofascore enrichment complete")
+        except Exception as e:
+            logger.warning(f"Sofascore enricher failed (non-fatal): {e}")
+
+        # Stage 3: ESPN fallback — remaining leagues (shots-proxy xG)
         try:
             from espn_enricher import enrich_todays_fixtures as espn_enrich
             espn_enrich(match_date=today)
@@ -935,6 +1532,9 @@ def run(
     if portfolio:
         save_portfolio_predictions(portfolio, run_id)
 
+    brier        = get_brier_scores(last_n=100)
+    _blend       = brier.get("recommended_blend", 0.60)
+
     output = {
         "meta": {
             "run_id":              run_id,
@@ -946,7 +1546,7 @@ def run(
             "fixtures_from_cache": from_cache,
             "fixtures_with_edge":  sum(1 for p in all_preds if p["has_any_edge"]),
             "total_edge_bets":     len(edge_bets),
-            "blend_weight":        edge_bets[0]["blend_weight"] if edge_bets else 0.6,
+            "blend_weight":        edge_bets[0]["blend_weight"] if edge_bets else round(_blend, 3),
             "brier_calibration":   brier,
         },
         "output_slip":     portfolio,
@@ -1002,6 +1602,10 @@ def _print_summary(output):
             print(f"       Fatigue: home {hr:.0f}d rest / away {ar:.0f}d rest")
         # CLV target
         print(f"       CLV target: {s['odds']} — check closing line before kickoff")
+        # Corners line mismatch warning
+        if s.get("market") == "corners_over":
+            cline = s.get("corners_line_used", 9.5)
+            print(f"       ⚠ Corners line: {cline} — verify this matches Betika's actual line")
         if s.get("drift_note"):
             print(f"       {s['drift_note']}")
     if slip["parlay"]:
@@ -1019,6 +1623,348 @@ def _print_summary(output):
 # ══════════════════════════════════════════════
 # CLI
 # ══════════════════════════════════════════════
+def cmd_settle_all(json_path: str = "predictions_latest.json", dry_run: bool = False):
+    """
+    Auto-settle all predictions in a predictions JSON file.
+
+    For each prediction:
+      1. Look up the score from league_stats (matched by home/away/date).
+      2. Derive outcome (won=1 / lost=0) for the market.
+      3. Call settle_result() and update CalibrationLab.
+
+    Markets auto-derived from scoreline:
+      home_win, draw, away_win, over25, under25, over15, btts_yes, btts_no
+
+    Markets that need manual settle (no scoreline data):
+      corners_over, cards_over — printed as a reminder.
+
+    Usage:
+      python run_predictions.py settle-all
+      python run_predictions.py settle-all predictions_20260311_1511.json
+      python run_predictions.py settle-all --dry-run   (preview without writing)
+    """
+    import json as _json
+    from calibration import CalibrationLab
+    from store import save_model_metrics, _conn as _store_conn
+
+    init_db()
+
+    import glob as _glob, os as _os
+
+    # If default file has no edge bets, search for most recent file that does
+    def _load_with_bets(path):
+        try:
+            with open(path) as f:
+                d = _json.load(f)
+            if d.get("all_edge_bets"):
+                return d
+        except Exception:
+            pass
+        return None
+
+    data = _load_with_bets(json_path)
+    if not data:
+        # Try all timestamped prediction files, most recent first
+        candidates = sorted(
+            _glob.glob("predictions_*.json"),
+            key=_os.path.getmtime, reverse=True
+        )
+        for c in candidates:
+            data = _load_with_bets(c)
+            if data:
+                print(f"  Using {c} (predictions_latest.json had no edge bets)")
+                break
+
+    if not data:
+        print("No predictions file with edge bets found.")
+        print("Files checked: predictions_latest.json + predictions_*.json")
+        return
+
+    # all_edge_bets has one row per market with match_id, market, odds, p_true, stake_kes
+    all_preds = data.get("all_edge_bets", [])
+    if not all_preds:
+        print("No edge bets found in any predictions file.")
+        return
+
+    settled = 0
+    skipped_no_score = 0
+    skipped_market = 0
+    skipped_already = 0
+    voided = []
+    manual_needed = []
+
+    cal = CalibrationLab()
+
+    with _store_conn() as con:
+        # Pre-load already-settled canonical_id+market pairs to avoid duplicates
+        already_settled = {
+            (r["canonical_id"], r["market"])
+            for r in con.execute("SELECT canonical_id, market FROM results").fetchall()
+        }
+
+    for pred in all_preds:
+        cid    = pred.get("match_id") or pred.get("canonical_id", "")
+        market = pred.get("market", "")
+        odds   = float(pred.get("odds") or pred.get("decimal_odds") or 0)
+        p_true = pred.get("p_true", 0)
+        stake  = float(pred.get("stake_kes") or 0)
+        regime = pred.get("regime", "neutral")
+
+        if not cid or not market:
+            continue
+
+        # Corners/cards — look up from match_stats (populated by backfill)
+        if market in ("corners_over", "corners_under", "cards_over", "cards_under"):
+            with _store_conn() as con:
+                ms = con.execute("""
+                    SELECT corners_home, corners_away, cards_home, cards_away
+                    FROM match_stats WHERE canonical_id = ?
+                    LIMIT 1
+                """, (cid,)).fetchone()
+                # Fallback: join via fixtures → match_stats by home/away/date
+                if not ms and home_team and away_team:
+                    ms = con.execute("""
+                        SELECT ms.corners_home, ms.corners_away,
+                               ms.cards_home, ms.cards_away
+                        FROM match_stats ms
+                        JOIN fixtures f ON ms.canonical_id = f.canonical_id
+                        WHERE LOWER(TRIM(f.home)) = LOWER(TRIM(?))
+                          AND LOWER(TRIM(f.away)) = LOWER(TRIM(?))
+                          AND f.match_date = ?
+                        LIMIT 1
+                    """, (home_team, away_team, match_date_fmt)).fetchone()
+
+            if not ms or (ms["corners_home"] is None and ms["cards_home"] is None):
+                manual_needed.append(f"  {cid}  {market}  @ {odds}  (no stats in DB yet)")
+                skipped_no_score += 1
+                continue
+
+            if market in ("corners_over", "corners_under"):
+                if ms["corners_home"] is None:
+                    manual_needed.append(f"  {cid}  {market}  @ {odds}  (corners not in DB)")
+                    skipped_no_score += 1
+                    continue
+                total_corners = ms["corners_home"] + ms["corners_away"]
+                # Get the line from the prediction's placed odds context
+                # Use the corners_line stored in the edge bet if available, else 9.5
+                corners_line = float(pred.get("corners_line_used") or pred.get("corners_line") or 9.5)
+                if market == "corners_over":
+                    outcome = 1 if total_corners > corners_line else 0
+                else:
+                    outcome = 1 if total_corners <= corners_line else 0
+                result_detail = f"{ms['corners_home']}+{ms['corners_away']}={total_corners} vs line {corners_line}"
+
+            elif market in ("cards_over", "cards_under"):
+                if ms["cards_home"] is None:
+                    manual_needed.append(f"  {cid}  {market}  @ {odds}  (cards not in DB)")
+                    skipped_no_score += 1
+                    continue
+                total_cards = ms["cards_home"] + ms["cards_away"]
+                cards_line = float(pred.get("cards_line_used") or 3.5)
+                if market == "cards_over":
+                    outcome = 1 if total_cards > cards_line else 0
+                else:
+                    outcome = 1 if total_cards <= cards_line else 0
+                result_detail = f"{ms['cards_home']}+{ms['cards_away']}={total_cards} vs line {cards_line}"
+
+            pnl = round((odds - 1) * stake if outcome else -stake, 2)
+            result_str = "WON " if outcome else "LOSS"
+            if dry_run:
+                print(f"  [DRY] {cid:<30} {market:<14} {result_str}  {result_detail}  pnl={pnl:+.0f}")
+                settled += 1
+                continue
+            settle_result(
+                canonical_id=cid, market=market, outcome=outcome,
+                closing_odds=odds, placed_odds=odds,
+                stake_kes=stake, pnl_kes=pnl,
+            )
+            cal.record(market, p_true, outcome, regime=regime)
+            metrics = cal.compute_metrics(market)
+            save_model_metrics({market: metrics.__dict__})
+            already_settled.add((cid, market))
+            settled += 1
+            print(f"  ✓ {cid:<30} {market:<14} {result_str}  {result_detail}  pnl={pnl:+.0f}")
+            continue
+
+        # Skip already settled
+        if (cid, market) in already_settled:
+            skipped_already += 1
+            continue
+
+        # Look up score from league_stats
+        # Try direct league_stats match via canonical_id → fixture home/away/date first,
+        # then fall back to matching by home/away name extracted from canonical_id date suffix
+        match_date = cid[-8:]  # last 8 chars = YYYYMMDD
+        match_date_fmt = f"{match_date[:4]}-{match_date[4:6]}-{match_date[6:8]}"
+        home_team = pred.get("home", "")
+        away_team = pred.get("away", "")
+        with _store_conn() as con:
+            # Primary: join via fixtures table
+            row = con.execute("""
+                SELECT ls.home_goals, ls.away_goals, ls.total_goals
+                FROM fixtures f
+                JOIN league_stats ls
+                  ON LOWER(TRIM(ls.home_team)) = LOWER(TRIM(f.home))
+                 AND LOWER(TRIM(ls.away_team)) = LOWER(TRIM(f.away))
+                 AND ls.match_date = f.match_date
+                WHERE f.canonical_id = ?
+                  AND ls.home_goals IS NOT NULL
+                LIMIT 1
+            """, (cid,)).fetchone()
+            # Fallback: direct league_stats match by home/away/date
+            if not row and home_team and away_team:
+                row = con.execute("""
+                    SELECT home_goals, away_goals, total_goals
+                    FROM league_stats
+                    WHERE LOWER(TRIM(home_team)) = LOWER(TRIM(?))
+                      AND LOWER(TRIM(away_team)) = LOWER(TRIM(?))
+                      AND match_date = ?
+                      AND home_goals IS NOT NULL
+                    LIMIT 1
+                """, (home_team, away_team, match_date_fmt)).fetchone()
+
+        # If not in league_stats yet (same-day match), try ESPN live scoreboard
+        if not row and home_team and away_team:
+            try:
+                import urllib.request, json as _espn_json
+                from normalizer import normalize_team as _nt
+                ESPN_LEAGUES_SETTLE = {
+                    "Premier League": "eng.1", "Championship": "eng.2",
+                    "League One": "eng.3", "League Two": "eng.4",
+                    "La Liga": "esp.1", "Segunda Division": "esp.2",
+                    "Bundesliga": "ger.1", "2. Bundesliga": "ger.2",
+                    "Serie A": "ita.1", "Serie B": "ita.2",
+                    "Ligue 1": "fra.1", "Ligue 2": "fra.2",
+                    "Eredivisie": "ned.1", "Primeira Liga": "por.1",
+                    "Süper Lig": "tur.1", "Scottish Premiership": "sco.1",
+                    "Belgian Pro League": "bel.1", "Danish Superliga": "den.1",
+                    "Russian Premier League": "rus.1",
+                    "Champions League": "uefa.champions",
+                    "Europa League": "uefa.europa",
+                    "Conference League": "uefa.europa.conf",
+                    "Liga MX": "mex.1", "MLS": "usa.1",
+                    "Brasileirao": "bra.1", "Argentine Primera": "arg.1",
+                    "Saudi Pro League": "ksa.1", "A-League": "aus.1",
+                    # International
+                    "UEFA World Cup Qualifiers":     "fifa.worldq.uefa",
+                    "CONMEBOL World Cup Qualifiers": "fifa.worldq.conmebol",
+                    "CONCACAF World Cup Qualifiers": "fifa.worldq.concacaf",
+                    "CAF World Cup Qualifiers":      "fifa.worldq.caf",
+                    "AFC World Cup Qualifiers":      "fifa.worldq.afc",
+                    "UEFA Nations League":           "uefa.nations",
+                    "CONCACAF Nations League":       "concacaf.nations",
+                    "Copa America":                  "conmebol.america",
+                    "AFCON":                         "caf.nations",
+                    "AFC Asian Cup":                 "afc.cup",
+                    "International Friendlies":      "fifa.friendly",
+                }
+                league_name = pred.get("league", "")
+                code = ESPN_LEAGUES_SETTLE.get(league_name)
+                if code:
+                    url = (f"https://site.api.espn.com/apis/site/v2/sports/soccer/"
+                           f"{code}/scoreboard?dates={match_date}")
+                    req = urllib.request.Request(url, headers={"User-Agent": "VantageSettle/1.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        espn_data = _espn_json.loads(resp.read())
+                    for event in espn_data.get("events", []):
+                        comp = event["competitions"][0]
+                        if comp.get("status", {}).get("type", {}).get("state") != "post":
+                            continue
+                        competitors = comp.get("competitors", [])
+                        if len(competitors) < 2:
+                            continue
+                        h_obj = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
+                        a_obj = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
+                        h_name = _nt(h_obj["team"]["displayName"])
+                        a_name = _nt(a_obj["team"]["displayName"])
+                        from fuzzywuzzy import fuzz
+                        if (fuzz.ratio(h_name.lower(), home_team.lower()) > 70 and
+                                fuzz.ratio(a_name.lower(), away_team.lower()) > 70):
+                            hg_live = int(h_obj.get("score", 0) or 0)
+                            ag_live = int(a_obj.get("score", 0) or 0)
+                            row = {"home_goals": hg_live, "away_goals": ag_live,
+                                   "total_goals": hg_live + ag_live}
+                            break
+            except Exception:
+                pass
+
+        if not row:
+            # Auto-void if match was >48h ago and still no score — stale pending
+            match_dt_str = match_date_fmt  # YYYY-MM-DD
+            try:
+                from datetime import date as _date
+                match_day = _date(int(match_dt_str[:4]), int(match_dt_str[5:7]), int(match_dt_str[8:10]))
+                days_old = (_date.today() - match_day).days
+                if days_old > 2:
+                    voided.append(f"  {cid:<30} {market:<14} VOID  ({days_old}d old, no score found)")
+                    skipped_no_score += 1
+                else:
+                    skipped_no_score += 1
+            except Exception:
+                skipped_no_score += 1
+            continue
+
+        hg = row["home_goals"]
+        ag = row["away_goals"]
+        tg = row["total_goals"] or (hg + ag)
+
+        # Derive outcome
+        outcome = None
+        if market == "home_win":   outcome = 1 if hg > ag else 0
+        elif market == "draw":     outcome = 1 if hg == ag else 0
+        elif market == "away_win": outcome = 1 if ag > hg else 0
+        elif market == "over25":   outcome = 1 if tg > 2 else 0
+        elif market == "under25":  outcome = 1 if tg <= 2 else 0
+        elif market == "over15":   outcome = 1 if tg > 1 else 0
+        elif market == "btts_yes": outcome = 1 if (hg > 0 and ag > 0) else 0
+        elif market == "btts_no":  outcome = 1 if not (hg > 0 and ag > 0) else 0
+
+        if outcome is None:
+            skipped_market += 1
+            continue
+
+        pnl = round((odds - 1) * stake if outcome else -stake, 2)
+        result_str = "WON " if outcome else "LOSS"
+
+        if dry_run:
+            print(f"  [DRY] {cid:<30} {market:<12} {result_str}  {hg}-{ag}  pnl={pnl:+.0f}")
+            settled += 1
+            continue
+
+        settle_result(
+            canonical_id=cid, market=market, outcome=outcome,
+            closing_odds=odds, placed_odds=odds,
+            stake_kes=stake, pnl_kes=pnl,
+        )
+
+        # Update CalibrationLab
+        cal.record(market, p_true, outcome, regime=regime)
+        metrics = cal.compute_metrics(market)
+        save_model_metrics({market: metrics.__dict__})
+
+        already_settled.add((cid, market))
+        settled += 1
+        print(f"  ✓ {cid:<30} {market:<12} {result_str}  {hg}-{ag}  pnl={pnl:+.0f}")
+
+    print(f"\n  Settled: {settled}")
+    print(f"  Already settled: {skipped_already}")
+    print(f"  No score yet: {skipped_no_score}")
+    if voided:
+        print(f"\n  Auto-voided (>48h, no score found):")
+        for v in voided:
+            print(v)
+        print(f"  → These bets cannot be settled automatically. Check results manually.")
+    if manual_needed:
+        print(f"\n  Corners/cards — settle manually:")
+        for m in manual_needed:
+            print(m)
+        print(f"\n  python run_predictions.py settle CANONICAL_ID corners_over 1 CLOSING_ODDS PLACED_ODDS STAKE PNL")
+
+    if settled > 0 and not dry_run:
+        brier = get_brier_scores()
+        print(f"\n  Brier calibration: n={brier['n']}  blend={brier['recommended_blend']:.3f}")
+
+
 def cmd_settle(args):
     init_db()
     outcome = int(args.outcome)
@@ -1029,8 +1975,6 @@ def cmd_settle(args):
         pnl_kes=float(args.pnl),
     )
     # Record in CalibrationLab for Brier/ECE/IR tracking
-    from store import _conn
-    from calibration import CalibrationLab
     from store import save_model_metrics
     with _conn() as con:
         pr = con.execute(
@@ -1061,16 +2005,32 @@ def cmd_stats():
         print(f"  Total PnL:   KES {clv['total_pnl']:,.0f}")
 
     brier = get_brier_scores()
-    if brier.get("n"):
-        print(f"\n  BRIER SCORES (n={brier['n']})")
-        print(f"  Model: {brier['model_brier']:.5f}  Market: {brier['market_brier']:.5f}")
-        print(f"  → Blend weight: {brier['recommended_blend']:.3f}")
+    print(f"\n  BRIER CALIBRATION (n={brier['n']})")
+    if brier["n"] == 0:
+        print(f"  No calibration data yet.")
+        print(f"  → Backfill runs automatically each session (needs predictions + scores to match).")
+        print(f"  → Need {brier['min_sample_for_blend']}+ results for blend formula, 200+ for stability.")
+    else:
+        if brier["model_brier"] is not None:
+            print(f"  Model BS:    {brier['model_brier']:.5f}")
+            print(f"  Market BS:   {brier['market_brier']:.5f}")
+        stable = " [STABLE]" if brier["blend_stable"] else f" (need {max(0, 200 - brier['n'])} more for stable)"
+        print(f"  Blend:       {brier['recommended_blend']:.3f}{stable}")
+        print(f"  Note:        {brier['note']}")
 
     markets = get_hit_rate_by_market()
     if markets:
-        print(f"\n  BY MARKET")
+        print(f"\n  BY MARKET (hit rate & ROI)")
         for m in markets:
             print(f"  {m['market']:<12} n={m['n']:>4}  hit={m['hit_rate']*100:.1f}%  roi={((m['roi'] or 0)*100):.1f}%")
+
+    brier_by_mkt = get_brier_by_market()
+    if brier_by_mkt:
+        print(f"\n  BRIER BY MARKET (model edge vs market)")
+        for m in brier_by_mkt:
+            edge_str = f"+{m['model_edge']:.4f}" if m['beating'] else f"{m['model_edge']:.4f}"
+            beat_icon = "✓" if m['beating'] else "✗"
+            print(f"  {beat_icon} {m['market']:<12} n={m['n']:>3}  model={m['model_brier']:.4f}  market={m['market_brier']:.4f}  edge={edge_str}")
 
     # ── Calibration Lab — full report ─────────────────────────────────────────
     from calibration import CalibrationLab
@@ -1113,11 +2073,19 @@ if __name__ == "__main__":
     p_settle.add_argument("stake")
     p_settle.add_argument("pnl")
 
+    p_settle_all = sub.add_parser("settle-all")
+    p_settle_all.add_argument("file", nargs="?", default="predictions_latest.json",
+                              help="Path to predictions JSON (default: predictions_latest.json)")
+    p_settle_all.add_argument("--dry-run", action="store_true",
+                              help="Preview outcomes without writing to DB")
+
     sub.add_parser("stats")
 
     args = parser.parse_args()
     if args.cmd == "settle":
         cmd_settle(args)
+    elif args.cmd == "settle-all":
+        cmd_settle_all(json_path=args.file, dry_run=args.dry_run)
     elif args.cmd == "stats":
         cmd_stats()
     else:

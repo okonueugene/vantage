@@ -298,12 +298,14 @@ def enrich_league(league_code: str, match_date: Optional[str] = None,
 
     enriched = 0
     for team in targets:
-        # Skip if fresh cache (unless force)
+        # Skip stats if fresh cache — but always re-fetch rest days (cheap, changes daily)
+        skip_stats = False
+        existing = None
         if not force:
             existing = get_cached_team_form(team, league_name)
             if existing and existing.get("avg_xg_for") is not None:
-                logger.debug(f"  {team}: cache fresh, skipping")
-                continue
+                skip_stats = True
+                logger.debug(f"  {team}: xG cache fresh, fetching rest only")
 
         # Resolve team ID — exact match, then fuzzy 4-char prefix
         tid = team_ids.get(team) or team_ids.get(_norm(team))
@@ -316,18 +318,43 @@ def enrich_league(league_code: str, match_date: Optional[str] = None,
         form_data: Dict = {}
 
         if tid:
-            stats = fetch_team_stats(tid, league_code)
-            if stats:
-                form_data.update(stats)
+            if not skip_stats:
+                stats = fetch_team_stats(tid, league_code)
+                if stats:
+                    form_data.update(stats)
+                    form_data["xg_source"] = "espn"
 
             rest = fetch_rest_days(tid, league_code, match_date)
             if rest is not None:
                 form_data["days_rest"] = rest
+
+            # When skipping stats, preserve existing xG and only refresh rest (avoid overwriting with NULL xG)
+            if skip_stats and existing and form_data:
+                form_data = {
+                    "league_position": existing.get("league_position"),
+                    "form_last5": existing.get("form_last5"),
+                    "avg_xg_for": existing.get("avg_xg_for"),
+                    "avg_xga": existing.get("avg_xga"),
+                    "avg_goals_for": existing.get("avg_goals_for"),
+                    "avg_goals_against": existing.get("avg_goals_against"),
+                    "avg_shots_on_target": existing.get("avg_shots_on_target"),
+                    "avg_shots": existing.get("avg_shots"),
+                    "injury_count": existing.get("injury_count"),
+                    "xg_source": existing.get("xg_source"),
+                    "days_rest": form_data.get("days_rest"),
+                }
         else:
             logger.debug(f"  {team}: no ESPN ID found")
 
-        if form_data:
-            save_team_form(team, league_name, form_data, ttl_hours=12)
+        CUP_LEAGUE_CODES = {
+            "uefa.europa", "uefa.champions", "uefa.europa.conf",
+            "usa.open", "eng.fa", "eng.league_cup",
+        }
+        has_stats = form_data.get("avg_xg_for") is not None or form_data.get("avg_goals_for") is not None
+
+        if has_stats:
+            # Full data — save normally
+            save_team_form(team, league_name, form_data, ttl_hours=36)
             enriched += 1
             logger.info(
                 f"  ✓ {team}: "
@@ -335,6 +362,17 @@ def enrich_league(league_code: str, match_date: Optional[str] = None,
                 f"goals/g={form_data.get('avg_goals_for','—')}  "
                 f"rest={form_data.get('days_rest','—')}d"
             )
+        elif form_data.get("days_rest") is not None:
+            if league_code in CUP_LEAGUE_CODES:
+                # Cup competition with no stats — only log rest days, do NOT save blank entry.
+                # The cross-league fallback in enrich_fixture will pick up the domestic entry.
+                enriched += 1
+                logger.info(f"  ✓ {team}: rest={form_data['days_rest']}d (cup, no stats — using domestic xG)")
+            else:
+                # Domestic league with rest days but no stats — still worth saving
+                save_team_form(team, league_name, form_data, ttl_hours=36)
+                enriched += 1
+                logger.info(f"  ✓ {team}: rest={form_data['days_rest']}d (no stats)")
         else:
             logger.debug(f"  {team}: no data retrieved")
 

@@ -148,8 +148,9 @@ class MetaErrorPredictor:
             score += self.WEIGHTS["compression_overs"]
             factors.append("Compression overs (historically 80% miss rate)")
 
-        # Small league sample
-        if signal.league_sample_size < 20:
+        # Small league sample — only when we have some data but it's thin.
+        # When 0 results: no penalty (no calibration yet, not "unreliable league").
+        if 1 <= signal.league_sample_size < 20:
             score += self.WEIGHTS["low_sample"]
             factors.append(f"Small sample ({signal.league_sample_size} results)")
 
